@@ -150,6 +150,20 @@ class GenerateDecoderOnlyOutput(ModelOutput):
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     past_key_values: Optional[Tuple[Tuple[Tuple[torch.FloatTensor]]]] = None
 
+# 在文件顶部，作为工具函数
+def convert_subwords_to_bytes(subword_tokens, tokenizer):
+    """
+    将子词 token 转换为字节级 token。
+    参数:
+        subword_tokens: 子词级 token (torch.Tensor)
+        tokenizer: 用于转换的 tokenizer，能够处理子词到字节的映射
+    返回:
+        字节级 token (torch.Tensor)
+    """
+    subword_texts = tokenizer.batch_decode(subword_tokens, skip_special_tokens=True)
+    byte_tokens = [list(text.encode('utf-8')) for text in subword_texts]
+    byte_token_ids = [torch.tensor(tokens, dtype=torch.long) for tokens in byte_tokens]
+    return torch.nn.utils.rnn.pad_sequence(byte_token_ids, batch_first=True)
 
 @dataclass
 class GenerateEncoderDecoderOutput(ModelOutput):
@@ -4136,6 +4150,7 @@ class GenerationMixin:
         else:
             return sequence_outputs["sequences"]
 
+    
     def _assisted_decoding(
         self,
         input_ids: torch.LongTensor,
@@ -4219,11 +4234,14 @@ class GenerationMixin:
             #  1. Fetch candidate sequences from a `CandidateGenerator`
             candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids)
 
+            # -- 1. 修改建议 1: 将辅助生成的子词 token 转换为字节级 token --
+            candidate_input_ids_bytes = convert_subwords_to_bytes(candidate_input_ids, assistant_tokenizer)
+
             if candidate_logits is not None:
                 candidate_logits = candidate_logits.to(self.device)
 
-            candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
-            is_done_candidate = stopping_criteria(candidate_input_ids, None)
+            candidate_length = candidate_input_ids_bytes.shape[1] - input_ids.shape[1]
+            is_done_candidate = stopping_criteria(candidate_input_ids_bytes, None)
 
             # 2. Use the original model to obtain the next token logits given the candidate sequence. We obtain
             # `candidate_length + 1` relevant logits from this process: in the event that all candidates are correct,
@@ -4232,15 +4250,15 @@ class GenerationMixin:
             # 2.1. Prepare the model inputs
             candidate_kwargs = copy.copy(model_kwargs)
             candidate_kwargs = _prepare_attention_mask(
-                candidate_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
+                candidate_kwargs, candidate_input_ids_bytes.shape[1], self.config.is_encoder_decoder
             )
             candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, candidate_input_ids.shape[1])
+
             if "cache_position" in candidate_kwargs:
+            # 保留到分歧点 c 之前的缓存
                 candidate_kwargs["cache_position"] = torch.cat(
-                    (
-                        candidate_kwargs["cache_position"],
-                        torch.arange(cur_len, cur_len + candidate_length, device=input_ids.device, dtype=torch.long),
-                    ),
+                    (candidate_kwargs["cache_position"][:cur_len],  
+                    torch.arange(cur_len, cur_len + candidate_length, device=input_ids.device, dtype=torch.long)),
                     dim=0,
                 )
 
@@ -4269,7 +4287,7 @@ class GenerationMixin:
             # 👉 Apply algorithm 1 from the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf).
             if do_sample and candidate_logits is not None:
                 valid_tokens, n_matches = _speculative_sampling(
-                    candidate_input_ids,
+                    candidate_input_ids_bytes,
                     candidate_logits,
                     candidate_length,
                     new_logits,
@@ -4286,8 +4304,16 @@ class GenerationMixin:
                 else:
                     selected_tokens = new_logits.argmax(dim=-1)
 
-                candidate_new_tokens = candidate_input_ids[:, cur_len:]
-                n_matches = ((~(candidate_new_tokens == selected_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
+                candidate_new_tokens = candidate_input_ids_bytes[:, cur_len:]
+
+                # -- 修改建议 2: 查找分歧点并更新 input_ids --
+                for i in range(candidate_length):
+                    if candidate_input_ids_bytes[:, i] != selected_tokens[:, i]:
+                        break
+                
+                # 更新 input_ids 到分歧点位置
+                input_ids = torch.cat((input_ids, selected_tokens[:, :i]), dim=-1)
+                n_matches = i  # 更新 n_matches 为分歧点之前匹配的 token 数量
 
                 # Ensure we don't generate beyond max_len or an EOS token
                 if is_done_candidate and n_matches == candidate_length:
